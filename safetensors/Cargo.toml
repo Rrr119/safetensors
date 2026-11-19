@@ -29,6 +29,7 @@ serde = { version = "1.0", default-features = false, features = [
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 hashbrown = { version = "0.17", features = ["serde"] }
 tempfile = { version = "3", optional = true }
+memmap2 = { version = "0.9", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -39,11 +40,16 @@ memmap2 = "0.9"
 proptest = "1.11"
 
 [features]
-default = ["std"]
+default = ["std", "mmap"]
 std = ["serde/default", "serde_json/default", "dep:tempfile"]
+mmap = ["std", "dep:memmap2"]
 # Kept for backward compatibility - no-op since alloc is always available
 alloc = []
 
 [[bench]]
 name = "benchmark"
+harness = false
+
+[[bench]]
+name = "incremental"
 harness = false

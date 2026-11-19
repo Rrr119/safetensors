@@ -787,13 +787,33 @@ impl Open {
             )));
         }
 
-        // SAFETY: Mmap is used to prevent allocating in Rust
-        // before making a copy within Python.
-        let buffer = unsafe { MmapOptions::new().map_copy_read_only(&*file)? };
+        // The pread backend never uses the mapping, so only read the header
+        // instead of mapping the whole checkpoint just to parse it.
+        let buffer = if backend == Backend::Pread {
+            None
+        } else {
+            // SAFETY: Mmap is used to prevent allocating in Rust
+            // before making a copy within Python.
+            Some(unsafe { MmapOptions::new().map_copy_read_only(&*file)? })
+        };
 
-        let (n, metadata) = SafeTensors::read_metadata(&buffer).map_err(|e| {
-            SafetensorError::new_err(format!("Error while deserializing header: {e}"))
-        })?;
+        let (n, metadata) = match &buffer {
+            Some(buffer) => SafeTensors::read_metadata(buffer),
+            None => {
+                let total_len = file
+                    .metadata()
+                    .map_err(|e| {
+                        SafetensorError::new_err(format!(
+                            "Error while reading the file length: {e}"
+                        ))
+                    })?
+                    .len()
+                    .try_into()
+                    .map_err(|_| SafetensorError::new_err("File is too large"))?;
+                SafeTensors::read_metadata_from_reader(&*file, total_len)
+            }
+        }
+        .map_err(|e| SafetensorError::new_err(format!("Error while deserializing header: {e}")))?;
 
         let offset = n + 8;
         Python::attach(|py| -> PyResult<()> {
@@ -827,6 +847,7 @@ impl Open {
             });
         }
 
+        let buffer = buffer.expect("the mmap backend always maps the file");
         let storage = match &framework {
             Framework::Paddle => Python::attach(|py| -> PyResult<Storage> {
                 let paddle = get_module(py, &PADDLE_MODULE)?;
@@ -1643,6 +1664,97 @@ impl Open {
             data_offsets: info.data_offsets,
         })
     }
+
+    /// Read a tensor's bytes into a caller-provided buffer.
+    ///
+    /// The caller owns the destination and decides how many reads are in
+    /// flight: separate calls can run concurrently from separate threads,
+    /// each into its own buffer. Nothing is read for tensors that are not
+    /// requested.
+    ///
+    /// `dst` must be a contiguous, writable CPU tensor or numpy array of
+    /// at least the tensor's size in bytes. A pinned buffer
+    /// (`torch.empty(n, dtype=torch.uint8, pin_memory=True)`) makes the
+    /// following host-to-device copy run at the full link rate.
+    ///
+    /// Returns the number of bytes read.
+    pub fn get_tensor_into(
+        &self,
+        py: Python<'_>,
+        dst: &PyBound<'_, PyAny>,
+        name: &str,
+    ) -> PyResult<usize> {
+        let info = self.metadata.info(name).ok_or_else(|| {
+            SafetensorError::new_err(format!("File does not contain tensor {name}"))
+        })?;
+        let (begin, end) = info.data_offsets;
+        let nbytes = end - begin;
+
+        let buffer = WriteBuffer::from_tensor(py, dst, nbytes)?;
+        if nbytes == 0 {
+            return Ok(0);
+        }
+
+        let file_offset = (self.offset + begin) as u64;
+        match self.storage.as_ref() {
+            Storage::Pread(file) => {
+                py.detach(|| {
+                    // SAFETY: `buffer.ptr`/`nbytes` name the caller's live
+                    // destination, and the region is disjoint from every
+                    // other destination.
+                    let dst =
+                        unsafe { std::slice::from_raw_parts_mut(buffer.ptr as *mut u8, nbytes) };
+                    read_exact_at(file, dst, file_offset).map_err(|e| {
+                        SafetensorError::new_err(format!(
+                            "Could not read tensor {name} from file: {e}"
+                        ))
+                    })
+                })?;
+            }
+            Storage::Mmap(mmap) => {
+                let src_off = self.offset + begin;
+                let src = &mmap[src_off..src_off + nbytes];
+                py.detach(|| {
+                    // SAFETY: `buffer.ptr` names the caller's live
+                    // destination and `src` is a live mapping region.
+                    let dst =
+                        unsafe { std::slice::from_raw_parts_mut(buffer.ptr as *mut u8, nbytes) };
+                    dst.copy_from_slice(src);
+                });
+            }
+            Storage::Torch(storage) => {
+                let storage = storage.get().ok_or_else(|| {
+                    SafetensorError::new_err("Could not find storage".to_string())
+                })?;
+                let src_ptr = Python::attach(|py| -> PyResult<usize> {
+                    storage
+                        .bind(py)
+                        .call_method0(intern!(py, "data_ptr"))?
+                        .extract()
+                })?;
+                py.detach(|| {
+                    // SAFETY: the source is the torch storage held alive by
+                    // `self.storage`; the destination is the caller's live
+                    // buffer.
+                    let src = unsafe {
+                        std::slice::from_raw_parts(
+                            (src_ptr + self.offset + begin) as *const u8,
+                            nbytes,
+                        )
+                    };
+                    let dst =
+                        unsafe { std::slice::from_raw_parts_mut(buffer.ptr as *mut u8, nbytes) };
+                    dst.copy_from_slice(src);
+                });
+            }
+            Storage::Paddle(_) => {
+                return Err(SafetensorError::new_err(
+                    "get_tensor_into is not supported for the paddle framework",
+                ));
+            }
+        }
+        Ok(nbytes)
+    }
 }
 
 impl From<LoaderError> for PyErr {
@@ -1808,6 +1920,31 @@ impl safe_open {
     ///         as written in the file header.
     pub fn get_tensor_meta(&self, name: &str) -> PyResult<TensorMeta> {
         self.inner()?.get_tensor_meta(name)
+    }
+
+    /// Read a tensor's bytes into a caller-provided buffer.
+    ///
+    /// The caller owns `dst` and decides how many reads are in flight:
+    /// separate calls can run concurrently from separate threads, each
+    /// into its own destination.
+    ///
+    /// Args:
+    ///     dst (`torch.Tensor` or `numpy.ndarray`):
+    ///         A contiguous, writable CPU buffer of at least the tensor's
+    ///         size in bytes.
+    ///     name (`str`):
+    ///         The tensor to read.
+    ///
+    /// Returns:
+    ///     (`int`):
+    ///         The number of bytes read.
+    pub fn get_tensor_into(
+        &self,
+        py: Python<'_>,
+        dst: &PyBound<'_, PyAny>,
+        name: &str,
+    ) -> PyResult<usize> {
+        self.inner()?.get_tensor_into(py, dst, name)
     }
 
     /// Returns the names of the tensors in the file, ordered by offset.
@@ -2367,6 +2504,71 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()
             written += n;
         }
         Ok(())
+    }
+}
+
+/// A writable host buffer a tensor's bytes can be read into.
+///
+/// The address comes from a caller-provided tensor, so the caller owns the
+/// destination and can pin it or reuse it across reads.
+struct WriteBuffer {
+    ptr: usize,
+}
+
+impl WriteBuffer {
+    fn from_tensor(py: Python<'_>, dst: &PyBound<'_, PyAny>, nbytes: usize) -> PyResult<Self> {
+        let ptr = if dst.hasattr(intern!(py, "data_ptr"))? {
+            // A torch tensor.
+            dst.call_method0(intern!(py, "data_ptr"))?
+                .extract::<usize>()?
+        } else if dst.hasattr(intern!(py, "ctypes"))? {
+            // A numpy array: its buffer starts at `ctypes.data`.
+            dst.getattr(intern!(py, "ctypes"))?
+                .getattr(intern!(py, "data"))?
+                .extract::<usize>()?
+        } else {
+            return Err(SafetensorError::new_err(
+                "get_tensor_into expects a torch tensor or a numpy array as the destination",
+            ));
+        };
+
+        if dst.hasattr(intern!(py, "is_contiguous"))? {
+            let contiguous: bool = dst.call_method0(intern!(py, "is_contiguous"))?.extract()?;
+            if !contiguous {
+                return Err(SafetensorError::new_err(
+                    "get_tensor_into expects a contiguous destination",
+                ));
+            }
+        } else if dst.hasattr(intern!(py, "flags"))? {
+            let flags = dst.getattr(intern!(py, "flags"))?;
+            if !flags
+                .getattr(intern!(py, "c_contiguous"))?
+                .extract::<bool>()?
+            {
+                return Err(SafetensorError::new_err(
+                    "get_tensor_into expects a contiguous destination",
+                ));
+            }
+            if !flags.getattr(intern!(py, "writeable"))?.extract::<bool>()? {
+                return Err(SafetensorError::new_err(
+                    "get_tensor_into expects a writable destination",
+                ));
+            }
+        }
+
+        let capacity = if dst.hasattr(intern!(py, "nbytes"))? {
+            dst.getattr(intern!(py, "nbytes"))?.extract::<usize>()?
+        } else {
+            let len: usize = dst.call_method0(intern!(py, "numel"))?.extract()?;
+            let itemsize: usize = dst.call_method0(intern!(py, "element_size"))?.extract()?;
+            len.saturating_mul(itemsize)
+        };
+        if capacity < nbytes {
+            return Err(SafetensorError::new_err(format!(
+                "get_tensor_into: the destination holds {capacity} bytes but the tensor needs {nbytes}"
+            )));
+        }
+        Ok(Self { ptr })
     }
 }
 
@@ -2952,6 +3154,18 @@ impl _safe_open_handle {
     ///         as written in the file header. Works on every backend.
     pub fn get_tensor_meta(&self, name: &str) -> PyResult<TensorMeta> {
         self.inner()?.get_tensor_meta(name)
+    }
+
+    /// Read a tensor's bytes into a caller-provided buffer.
+    ///
+    /// See [`safe_open::get_tensor_into`].
+    pub fn get_tensor_into(
+        &self,
+        py: Python<'_>,
+        dst: &PyBound<'_, PyAny>,
+        name: &str,
+    ) -> PyResult<usize> {
+        self.inner()?.get_tensor_into(py, dst, name)
     }
 
     /// Returns the names of the tensors in the file, ordered by offset.

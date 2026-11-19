@@ -292,6 +292,7 @@ version = "0.9.0-dev.0"
 dependencies = [
  "hashbrown",
  "libc",
+ "memmap2",
  "serde",
  "serde_json",
  "tempfile",

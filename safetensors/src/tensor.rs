@@ -5,10 +5,15 @@ use core::fmt::Display;
 use core::str::Utf8Error;
 use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(feature = "std")]
-use std::{io::Write, path::Path};
+use std::{
+    fs::File,
+    io::{Read, Write},
+    path::Path,
+};
 
 const MAX_HEADER_SIZE: usize = 100_000_000;
-const N_LEN: usize = size_of::<u64>();
+/// Number of bytes in the little-endian header-length prefix.
+pub const N_LEN: usize = size_of::<u64>();
 
 /// Possible errors that could occur while reading
 /// A Safetensor file.
@@ -385,6 +390,23 @@ pub struct SafeTensors<'data> {
 }
 
 impl<'data> SafeTensors<'data> {
+    fn parse_metadata(
+        n: usize,
+        header_bytes: &[u8],
+        buffer_len: usize,
+    ) -> Result<Metadata, SafeTensorError> {
+        let string = core::str::from_utf8(header_bytes).map_err(SafeTensorError::InvalidHeader)?;
+        let metadata: HashMetadata =
+            serde_json::from_str(string).map_err(SafeTensorError::InvalidHeaderDeserialization)?;
+        let metadata: Metadata = metadata.try_into()?;
+        let buffer_end = metadata.validate()?;
+        if buffer_end + N_LEN + n != buffer_len {
+            return Err(SafeTensorError::MetadataIncompleteBuffer);
+        }
+
+        Ok(metadata)
+    }
+
     /// Given a byte-buffer representing the whole safetensor file
     /// parses the header, and returns the size of the header + the parsed data.
     pub fn read_metadata(buffer: &'data [u8]) -> Result<(usize, Metadata), SafeTensorError> {
@@ -412,16 +434,74 @@ impl<'data> SafeTensors<'data> {
         let Some(header_bytes) = buffer.get(N_LEN..stop) else {
             return Err(SafeTensorError::InvalidHeaderLength);
         };
-        let string = core::str::from_utf8(header_bytes).map_err(SafeTensorError::InvalidHeader)?;
-        let metadata: HashMetadata =
-            serde_json::from_str(string).map_err(SafeTensorError::InvalidHeaderDeserialization)?;
-        let metadata: Metadata = metadata.try_into()?;
-        let buffer_end = metadata.validate()?;
-        if buffer_end + N_LEN + n != buffer_len {
-            return Err(SafeTensorError::MetadataIncompleteBuffer);
-        }
+        let metadata = Self::parse_metadata(n, header_bytes, buffer_len)?;
 
         Ok((n, metadata))
+    }
+
+    /// Parses only the header from a reader, without reading the tensor data.
+    ///
+    /// `total_len` is the full length of the file. It is used to validate
+    /// that the header's offsets cover the complete payload, exactly like
+    /// [`SafeTensors::read_metadata`].
+    ///
+    /// This is the incremental counterpart to [`SafeTensors::deserialize`]:
+    /// only the 8-byte length prefix and the JSON header are read, which
+    /// makes it suitable for large files or for reading a header over a
+    /// remote / range-request transport.
+    ///
+    /// ```
+    /// use safetensors::SafeTensors;
+    /// use std::io::Cursor;
+    ///
+    /// let bytes = b"<\x00\x00\x00\x00\x00\x00\x00{\"test\":{\"dtype\":\"I32\",\"shape\":[2,2],\"data_offsets\":[0,16]}}\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    /// let total_len = bytes.len();
+    /// let (_header_len, metadata) =
+    ///     SafeTensors::read_metadata_from_reader(Cursor::new(bytes), total_len).unwrap();
+    /// assert!(metadata.info("test").is_some());
+    /// ```
+    #[cfg(feature = "std")]
+    pub fn read_metadata_from_reader<R: Read>(
+        mut reader: R,
+        total_len: usize,
+    ) -> Result<(usize, Metadata), SafeTensorError> {
+        let mut size_buf = [0u8; N_LEN];
+        reader
+            .read_exact(&mut size_buf)
+            .map_err(|_| SafeTensorError::HeaderTooSmall)?;
+
+        let n: usize = u64::from_le_bytes(size_buf)
+            .try_into()
+            .map_err(|_| SafeTensorError::HeaderTooLarge)?;
+
+        if n > MAX_HEADER_SIZE {
+            return Err(SafeTensorError::HeaderTooLarge);
+        }
+        if N_LEN.checked_add(n).is_none_or(|end| end > total_len) {
+            return Err(SafeTensorError::InvalidHeaderLength);
+        }
+
+        let mut header_bytes = vec![0u8; n];
+        reader
+            .read_exact(&mut header_bytes)
+            .map_err(|_| SafeTensorError::InvalidHeaderLength)?;
+
+        let metadata = Self::parse_metadata(n, &header_bytes, total_len)?;
+        Ok((n, metadata))
+    }
+
+    /// Opens `path` and parses only its header, leaving the payload on disk.
+    #[cfg(feature = "std")]
+    pub fn read_metadata_from_file(
+        path: impl AsRef<Path>,
+    ) -> Result<(usize, Metadata), SafeTensorError> {
+        let file = File::open(path)?;
+        let total_len: usize = file
+            .metadata()?
+            .len()
+            .try_into()
+            .map_err(|_| SafeTensorError::HeaderTooLarge)?;
+        Self::read_metadata_from_reader(file, total_len)
     }
 
     /// Given a byte-buffer representing the whole safetensor file
@@ -676,6 +756,21 @@ impl Metadata {
             .iter()
             .map(|(tensor_name, &index)| (tensor_name.clone(), &self.tensors[index]))
             .collect()
+    }
+
+    /// Returns the tensor names.
+    pub fn names(&self) -> Vec<&str> {
+        self.index_map.keys().map(String::as_str).collect()
+    }
+
+    /// Returns how many tensors the metadata contains.
+    pub fn len(&self) -> usize {
+        self.tensors.len()
+    }
+
+    /// Returns whether the metadata contains no tensors.
+    pub fn is_empty(&self) -> bool {
+        self.tensors.is_empty()
     }
 
     /// Gives back the tensor names ordered by offset

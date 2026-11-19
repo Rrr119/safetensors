@@ -367,6 +367,21 @@ class safe_open:
                 The name of the tensor
         """
         pass
+
+    def get_tensor_into(self, dst, name: str) -> int:
+        """
+        Reads a tensor's bytes into a caller-provided contiguous CPU buffer.
+
+        With the `"pread"` backend the bytes are read directly into `dst`,
+        with no intermediate copy. `dst` may be a torch tensor or a numpy
+        array and must be writable and large enough for the tensor.
+
+        Returns:
+            (`int`):
+                The number of bytes read.
+        """
+        pass
+
     def keys(self):
         """
         Returns the names of the tensors in the file.

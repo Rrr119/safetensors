@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid26350",
+  "B": "/home/dev/feedback/uid26350",
+  "sha": "0ba26f18d07707b6f9a81c1f0a5c7f3a287e403a",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "huggingface",
+    "repo": "safetensors",
+    "sha": "0ba26f18d07707b6f9a81c1f0a5c7f3a287e403a"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "safetensors",
+    "cloneUrl": "https://github.com/Rrr119/safetensors.git"
+  },
+  "at": "2026-11-19T04:28:57.726Z"
+}
